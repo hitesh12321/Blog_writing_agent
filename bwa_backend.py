@@ -1,18 +1,18 @@
 from __future__ import annotations
-
+# from together import Together
 import operator
 import os
 import re
 from datetime import date, timedelta
 from pathlib import Path
 from typing import TypedDict, List, Optional, Literal, Annotated
-
+import base64
 from pydantic import BaseModel, Field
 
 from langgraph.graph import StateGraph, START, END
 from langgraph.types import Send
 
-from langchain_openai import ChatOpenAI
+from langchain_groq import ChatGroq
 from langchain_core.messages import SystemMessage, HumanMessage
 from dotenv import load_dotenv
 
@@ -24,66 +24,73 @@ load_dotenv()
 #   merge_content -> decide_images -> generate_and_place_images
 # ============================================================
 
+from langchain_core.rate_limiters import InMemoryRateLimiter
 
+rate_limiter = InMemoryRateLimiter(
+    requests_per_second=0.15,   # roughly 1 request every ~6-7 sec, safe margin
+    check_every_n_seconds=0.1,
+    max_bucket_size=2,
+)
 # -----------------------------
 # 1) Schemas
 # -----------------------------
 class Task(BaseModel):
+    # All fields are required because Groq strict JSON Schema requires
+    # every property to appear in "required".
     id: int
     title: str
     goal: str = Field(..., description="One sentence describing what the reader should do/understand.")
-    bullets: List[str] = Field(..., min_length=3, max_length=6)
-    target_words: int = Field(..., description="Target words (120–550).")
-
-    tags: List[str] = Field(default_factory=list)
-    requires_research: bool = False
-    requires_citations: bool = False
-    requires_code: bool = False
+    bullets: List[str]
+    target_words: int
+    tags: List[str]
+    requires_research: bool
+    requires_citations: bool
+    requires_code: bool
 
 
 class Plan(BaseModel):
     blog_title: str
     audience: str
     tone: str
-    blog_kind: Literal["explainer", "tutorial", "news_roundup", "comparison", "system_design"] = "explainer"
-    constraints: List[str] = Field(default_factory=list)
+    blog_kind: Literal["explainer", "tutorial", "news_roundup", "comparison", "system_design"]
+    constraints: List[str]
     tasks: List[Task]
 
 
 class EvidenceItem(BaseModel):
     title: str
     url: str
-    published_at: Optional[str] = None  # ISO "YYYY-MM-DD" preferred
-    snippet: Optional[str] = None
-    source: Optional[str] = None
+    published_at: Optional[str]  # Required but nullable.
+    snippet: Optional[str]       # Required but nullable.
+    source: Optional[str]        # Required but nullable.
 
 
 class RouterDecision(BaseModel):
     needs_research: bool
     mode: Literal["closed_book", "hybrid", "open_book"]
     reason: str
-    queries: List[str] = Field(default_factory=list)
-    max_results_per_query: int = Field(5)
+    queries: List[str]
+    max_results_per_query: int
 
 
 class EvidencePack(BaseModel):
-    evidence: List[EvidenceItem] = Field(default_factory=list)
+    evidence: List[EvidenceItem]
 
 
-# ---- Image planning schema (ported from your image flow) ----
+# ---- Image planning schema ----
 class ImageSpec(BaseModel):
     placeholder: str = Field(..., description="e.g. [[IMAGE_1]]")
     filename: str = Field(..., description="Save under images/, e.g. qkv_flow.png")
     alt: str
     caption: str
     prompt: str = Field(..., description="Prompt to send to the image model.")
-    size: Literal["1024x1024", "1024x1536", "1536x1024"] = "1024x1024"
-    quality: Literal["low", "medium", "high"] = "medium"
+    size: Literal["1024x1024", "1024x1536", "1536x1024"]
+    quality: Literal["low", "medium", "high"]
 
 
 class GlobalImagePlan(BaseModel):
     md_with_placeholders: str
-    images: List[ImageSpec] = Field(default_factory=list)
+    images: List[ImageSpec]
 
 class State(TypedDict):
     topic: str
@@ -113,7 +120,20 @@ class State(TypedDict):
 # -----------------------------
 # 2) LLM
 # -----------------------------
-llm = ChatOpenAI(model="gpt-4.1-mini")
+llm = ChatGroq(
+    model="openai/gpt-oss-20b",
+    temperature=0,
+    rate_limiter=rate_limiter,
+)
+
+
+def structured_llm(schema):
+    """Return a Groq structured-output runnable using strict JSON Schema."""
+    return llm.with_structured_output(
+        schema,
+        method="json_schema",
+        strict=True,
+    )
 
 # -----------------------------
 # 3) Router
@@ -128,12 +148,12 @@ Modes:
 - open_book (needs_research=true): volatile weekly/news/"latest"/pricing/policy.
 
 If needs_research=true:
-- Output 3–10 high-signal, scoped queries.
+- Output 3–5 high-signal, scoped queries.
 - For open_book weekly roundup, include queries reflecting last 7 days.
 """
 
 def router_node(state: State) -> dict:
-    decider = llm.with_structured_output(RouterDecision)
+    decider = structured_llm(RouterDecision)
     decision = decider.invoke(
         [
             SystemMessage(content=ROUTER_SYSTEM),
@@ -193,26 +213,58 @@ def _iso_to_date(s: Optional[str]) -> Optional[date]:
 
 RESEARCH_SYSTEM = """You are a research synthesizer.
 
-Given raw web search results, produce EvidenceItem objects.
+Given raw web search results, extract useful evidence into the required EvidencePack schema.
+
+Return ONLY the structured EvidencePack. Do not return prose outside the schema.
 
 Rules:
-- Only include items with a non-empty url.
-- Prefer relevant + authoritative sources.
-- Normalize published_at to ISO YYYY-MM-DD if reliably inferable; else null (do NOT guess).
-- Keep snippets short.
+- Include only items with a non-empty URL.
+- Prefer relevant and authoritative sources.
 - Deduplicate by URL.
+- Keep snippets short.
+- Normalize published_at to ISO YYYY-MM-DD when reliably inferable; otherwise return null.
+- If source is unavailable, return null.
+- Never invent URLs, dates, sources, or facts.
+- The evidence field must always be present.
+- Every evidence item must contain title, url, published_at, snippet, and source.
 """
 
 def research_node(state: State) -> dict:
-    queries = (state.get("queries") or [])[:10]
+    queries = (state.get("queries") or [])[:5]
     raw: List[dict] = []
     for q in queries:
-        raw.extend(_tavily_search(q, max_results=6))
+        raw.extend(_tavily_search(q, max_results=3))
 
     if not raw:
         return {"evidence": []}
 
-    extractor = llm.with_structured_output(EvidencePack)
+    # --- Trim before sending to LLM ---
+    MAX_RESULTS = 15
+    MAX_SNIPPET_CHARS = 200
+
+    trimmed = []
+    seen_urls = set()
+    for r in raw:
+        url = r.get("url") or ""
+        if not url or url in seen_urls:
+            continue
+        seen_urls.add(url)
+        trimmed.append({
+            "title": (r.get("title") or "")[:120],
+            "url": url,
+            "snippet": (r.get("snippet") or "")[:MAX_SNIPPET_CHARS],
+            "published_at": r.get("published_at"),
+            "source": r.get("source"),
+        })
+        if len(trimmed) >= MAX_RESULTS:
+            break
+
+    raw_text = "\n".join(
+        f"- {r['title']} | {r['url']} | {r['published_at'] or 'date:unknown'} | {r['snippet']}"
+        for r in trimmed
+    )
+
+    extractor = structured_llm(EvidencePack)
     pack = extractor.invoke(
         [
             SystemMessage(content=RESEARCH_SYSTEM),
@@ -220,7 +272,7 @@ def research_node(state: State) -> dict:
                 content=(
                     f"As-of date: {state['as_of']}\n"
                     f"Recency days: {state['recency_days']}\n\n"
-                    f"Raw results:\n{raw}"
+                    f"Raw results:\n{raw_text}"
                 )
             ),
         ]
@@ -246,7 +298,9 @@ ORCH_SYSTEM = """You are a senior technical writer and developer advocate.
 Produce a highly actionable outline for a technical blog post.
 
 Requirements:
-- 5–9 tasks, each with goal + 3–6 bullets + target_words.
+- 4–5 tasks, each with goal + 2–3 bullets + target_words.
+- Keep the total blog concise.
+- Target 80–150 words per task.
 - Tags are flexible; do not force a fixed taxonomy.
 
 Grounding:
@@ -261,7 +315,7 @@ Output must match Plan schema.
 """
 
 def orchestrator_node(state: State) -> dict:
-    planner = llm.with_structured_output(Plan)
+    planner = structured_llm(Plan)
     mode = state.get("mode", "closed_book")
     evidence = state.get("evidence", [])
 
@@ -316,7 +370,9 @@ Write ONE section of a technical blog post in Markdown.
 
 Constraints:
 - Cover ALL bullets in order.
-- Target words ±15%.
+- Target words ±20%.
+- Keep the section concise.
+- Avoid repetition and unnecessary explanations.
 - Output only section markdown starting with "## <Section Title>".
 
 Scope guard:
@@ -341,7 +397,7 @@ def worker_node(payload: dict) -> dict:
     bullets_text = "\n- " + "\n- ".join(task.bullets)
     evidence_text = "\n".join(
         f"- {e.title} | {e.url} | {e.published_at or 'date:unknown'}"
-        for e in evidence[:20]
+        for e in evidence[:8]
     )
 
     section_md = llm.invoke(
@@ -391,16 +447,16 @@ DECIDE_IMAGES_SYSTEM = """You are an expert technical editor.
 Decide if images/diagrams are needed for THIS blog.
 
 Rules:
-- Max 3 images total.
-- Each image must materially improve understanding (diagram/flow/table-like visual).
-- Insert placeholders exactly: [[IMAGE_1]], [[IMAGE_2]], [[IMAGE_3]].
+- Max 2 images total.
+- Each image must materially improve understanding.
+- Insert placeholders exactly: [[IMAGE_1]] and [[IMAGE_2]].
 - If no images needed: md_with_placeholders must equal input and images=[].
 - Avoid decorative images; prefer technical diagrams with short labels.
 Return strictly GlobalImagePlan.
 """
 
 def decide_images(state: State) -> dict:
-    planner = llm.with_structured_output(GlobalImagePlan)
+    planner = structured_llm(GlobalImagePlan)
     merged_md = state["merged_md"]
     plan = state["plan"]
     assert plan is not None
@@ -424,53 +480,6 @@ def decide_images(state: State) -> dict:
         "image_specs": [img.model_dump() for img in image_plan.images],
     }
 
-
-def _gemini_generate_image_bytes(prompt: str) -> bytes:
-    """
-    Returns raw image bytes generated by Gemini.
-    Requires: pip install google-genai
-    Env var: GOOGLE_API_KEY
-    """
-    from google import genai
-    from google.genai import types
-
-    api_key = os.environ.get("GOOGLE_API_KEY")
-    if not api_key:
-        raise RuntimeError("GOOGLE_API_KEY is not set.")
-
-    client = genai.Client(api_key=api_key)
-
-    resp = client.models.generate_content(
-        model="gemini-2.5-flash-image",
-        contents=prompt,
-        config=types.GenerateContentConfig(
-            response_modalities=["IMAGE"],
-            safety_settings=[
-                types.SafetySetting(
-                    category="HARM_CATEGORY_DANGEROUS_CONTENT",
-                    threshold="BLOCK_ONLY_HIGH",
-                )
-            ],
-        ),
-    )
-
-    # Depending on SDK version, parts may hang off resp.candidates[0].content.parts
-    parts = getattr(resp, "parts", None)
-    if not parts and getattr(resp, "candidates", None):
-        try:
-            parts = resp.candidates[0].content.parts
-        except Exception:
-            parts = None
-
-    if not parts:
-        raise RuntimeError("No image content returned (safety/quota/SDK change).")
-
-    for part in parts:
-        inline = getattr(part, "inline_data", None)
-        if inline and getattr(inline, "data", None):
-            return inline.data
-
-    raise RuntimeError("No inline image bytes found in response.")
 
 
 def _safe_slug(title: str) -> str:
@@ -504,7 +513,7 @@ def generate_and_place_images(state: State) -> dict:
         # generate only if needed
         if not out_path.exists():
             try:
-                img_bytes = _gemini_generate_image_bytes(spec["prompt"])
+                img_bytes = _pollinations_generate_image_bytes(spec["prompt"], spec.get("size", "1024x1024"))
                 out_path.write_bytes(img_bytes)
             except Exception as e:
                 # graceful fallback: keep doc usable
@@ -523,6 +532,57 @@ def generate_and_place_images(state: State) -> dict:
     filename = f"{_safe_slug(plan.blog_title)}.md"
     Path(filename).write_text(md, encoding="utf-8")
     return {"final": md}
+
+
+
+
+import urllib.parse
+import requests
+
+def _pollinations_generate_image_bytes(prompt: str, size: str = "1024x1024") -> bytes:
+    """
+    Returns raw image bytes generated by Pollinations AI (free, no API key).
+    """
+    width_str, height_str = size.split("x")
+    width, height = int(width_str), int(height_str)
+
+    encoded_prompt = urllib.parse.quote(prompt)
+    url = (
+        f"https://image.pollinations.ai/prompt/{encoded_prompt}"
+        f"?width={width}&height={height}&nologo=true&model=flux"
+    )
+
+    resp = requests.get(url, timeout=60)
+    resp.raise_for_status()
+
+    if not resp.content or len(resp.content) < 1000:
+        raise RuntimeError("Pollinations returned empty/invalid image data.")
+
+    return resp.content
+
+def _pollinations_generate_image_bytes(prompt: str, size: str = "1024x1024") -> bytes:
+    """
+    Returns raw image bytes generated by Pollinations AI (free, no API key).
+    """
+    width_str, height_str = size.split("x")
+    width, height = int(width_str), int(height_str)
+
+    encoded_prompt = urllib.parse.quote(prompt)
+    url = (
+        f"https://image.pollinations.ai/prompt/{encoded_prompt}"
+        f"?width={width}&height={height}&nologo=true&model=flux"
+    )
+
+    resp = requests.get(url, timeout=60)
+    resp.raise_for_status()
+
+    if not resp.content or len(resp.content) < 1000:
+        raise RuntimeError("Pollinations returned empty/invalid image data.")
+
+    return resp.content
+
+
+
 
 # build reducer subgraph
 reducer_graph = StateGraph(State)
@@ -554,5 +614,3 @@ g.add_edge("worker", "reducer")
 g.add_edge("reducer", END)
 
 app = g.compile()
-app
-
