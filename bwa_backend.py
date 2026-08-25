@@ -1,12 +1,10 @@
 from __future__ import annotations
-# from together import Together
 import operator
 import os
 import re
 from datetime import date, timedelta
 from pathlib import Path
 from typing import TypedDict, List, Optional, Literal, Annotated
-import base64
 from pydantic import BaseModel, Field
 
 from langgraph.graph import StateGraph, START, END
@@ -95,6 +93,9 @@ class GlobalImagePlan(BaseModel):
 class State(TypedDict):
     topic: str
 
+    # user preferences from the UI (blog type, audience, tone, length, toggles)
+    prefs: dict
+
     # routing / research
     mode: str
     needs_research: bool
@@ -136,6 +137,44 @@ def structured_llm(schema):
     )
 
 # -----------------------------
+# 2b) UI preferences → graph controls
+# -----------------------------
+# Maps the UI "Blog Type" radio to the Plan.blog_kind enum.
+UI_BLOG_KIND = {
+    "Tutorial": "tutorial",
+    "Explainer": "explainer",
+    "News": "news_roundup",
+    "Comparison": "comparison",
+    "System Design": "system_design",
+}
+
+# Maps the UI "Length" radio to a total word budget and a section-count range.
+LENGTH_MAP = {
+    "Short":  {"words": 600,  "min_sections": 3, "max_sections": 3},
+    "Medium": {"words": 1200, "min_sections": 4, "max_sections": 5},
+    "Long":   {"words": 2000, "min_sections": 6, "max_sections": 8},
+}
+
+
+def _get_prefs(state: State) -> dict:
+    """Read UI preferences off the state with safe defaults.
+
+    Keeps the graph runnable even when invoked programmatically without a
+    full `prefs` block (defaults to a Medium, research-on Explainer).
+    """
+    p = (state.get("prefs") or {}) if isinstance(state, dict) else {}
+    return {
+        "blog_type": p.get("blog_type") or "Explainer",
+        "audience": p.get("audience") or "Intermediate",
+        "tone": p.get("tone") or "Professional",
+        "length": p.get("length") or "Medium",
+        "want_research": bool(p.get("want_research", True)),
+        "want_images": bool(p.get("want_images", True)),
+        "want_citations": bool(p.get("want_citations", True)),
+        "want_code": bool(p.get("want_code", True)),
+    }
+
+# -----------------------------
 # 3) Router
 # -----------------------------
 ROUTER_SYSTEM = """You are a routing module for a technical blog planner.
@@ -153,11 +192,33 @@ If needs_research=true:
 """
 
 def router_node(state: State) -> dict:
+    prefs = _get_prefs(state)
+
+    # Hard off: the user disabled web research → closed-book, skip the router LLM call.
+    if not prefs["want_research"]:
+        return {
+            "needs_research": False,
+            "mode": "closed_book",
+            "queries": [],
+            "recency_days": 3650,
+        }
+
+    # Research enabled: let the router decide the mode/queries (it may still fall
+    # back to closed_book for a truly evergreen topic — "settings guide, AI adapts").
     decider = structured_llm(RouterDecision)
     decision = decider.invoke(
         [
             SystemMessage(content=ROUTER_SYSTEM),
-            HumanMessage(content=f"Topic: {state['topic']}\nAs-of date: {state['as_of']}"),
+            HumanMessage(
+                content=(
+                    f"Topic: {state['topic']}\n"
+                    f"As-of date: {state['as_of']}\n"
+                    f"Blog type: {prefs['blog_type']}\n"
+                    "The user has ENABLED web research. Prefer hybrid or open_book and "
+                    "produce scoped queries, unless the topic is truly evergreen "
+                    "(in which case closed_book with no queries is acceptable)."
+                )
+            ),
         ]
     )
 
@@ -298,10 +359,11 @@ ORCH_SYSTEM = """You are a senior technical writer and developer advocate.
 Produce a highly actionable outline for a technical blog post.
 
 Requirements:
-- 4–5 tasks, each with goal + 2–3 bullets + target_words.
-- Keep the total blog concise.
-- Target 80–150 words per task.
+- Create the number of sections the user requested (see the section-count target).
+- Distribute the total target word budget across the sections; set each task's
+  target_words so the sum is close to the requested total.
 - Tags are flexible; do not force a fixed taxonomy.
+- Honor the user's requested blog type, audience, tone, and length.
 
 Grounding:
 - closed_book: evergreen, no evidence dependence.
@@ -311,15 +373,27 @@ Grounding:
   - No tutorial content unless requested
   - If evidence is weak, plan should explicitly reflect that (don’t invent events).
 
+Capability toggles (respect these when setting per-task flags):
+- If citations are disabled, set requires_citations=False for every task.
+- If code is disabled, set requires_code=False for every task.
+
 Output must match Plan schema.
 """
 
 def orchestrator_node(state: State) -> dict:
+    prefs = _get_prefs(state)
     planner = structured_llm(Plan)
     mode = state.get("mode", "closed_book")
     evidence = state.get("evidence", [])
 
-    forced_kind = "news_roundup" if mode == "open_book" else None
+    length = LENGTH_MAP.get(prefs["length"], LENGTH_MAP["Medium"])
+    if length["min_sections"] == length["max_sections"]:
+        sec_hint = f"{length['min_sections']} sections"
+    else:
+        sec_hint = f"{length['min_sections']}-{length['max_sections']} sections"
+    per_section = max(80, length["words"] // max(1, length["max_sections"]))
+
+    target_kind = UI_BLOG_KIND.get(prefs["blog_type"], "explainer")
 
     plan = planner.invoke(
         [
@@ -329,14 +403,34 @@ def orchestrator_node(state: State) -> dict:
                     f"Topic: {state['topic']}\n"
                     f"Mode: {mode}\n"
                     f"As-of: {state['as_of']} (recency_days={state['recency_days']})\n"
-                    f"{'Force blog_kind=news_roundup' if forced_kind else ''}\n\n"
+                    f"Requested blog type: {prefs['blog_type']} (blog_kind={target_kind})\n"
+                    f"Requested audience: {prefs['audience']}\n"
+                    f"Requested tone: {prefs['tone']}\n"
+                    f"Requested length: {prefs['length']} → about {sec_hint}, "
+                    f"~{length['words']} words total (~{per_section} words per section)\n"
+                    f"Web research: {'enabled' if prefs['want_research'] else 'disabled'}\n"
+                    f"Citations: {'allowed where sources support claims' if prefs['want_citations'] else 'DISABLED — set requires_citations=False on all tasks'}\n"
+                    f"Code examples: {'include where they aid understanding' if prefs['want_code'] else 'DISABLED — set requires_code=False on all tasks'}\n\n"
                     f"Evidence:\n{[e.model_dump() for e in evidence][:16]}"
                 )
             ),
         ]
     )
-    if forced_kind:
-        plan.blog_kind = "news_roundup"
+
+    # Deterministically honor the user's explicit radio selections.
+    plan.blog_kind = target_kind
+    plan.audience = prefs["audience"]
+    plan.tone = prefs["tone"]
+
+    # Enforce the capability toggles at the task level (belt-and-suspenders
+    # in case the planner ignored the instruction above).
+    for t in plan.tasks:
+        if not prefs["want_citations"]:
+            t.requires_citations = False
+        if not prefs["want_code"]:
+            t.requires_code = False
+        if not prefs["want_research"]:
+            t.requires_research = False
 
     return {"plan": plan}
 
@@ -346,6 +440,7 @@ def orchestrator_node(state: State) -> dict:
 # -----------------------------
 def fanout(state: State):
     assert state["plan"] is not None
+    prefs = _get_prefs(state)
     return [
         Send(
             "worker",
@@ -357,6 +452,8 @@ def fanout(state: State):
                 "recency_days": state["recency_days"],
                 "plan": state["plan"].model_dump(),
                 "evidence": [e.model_dump() for e in state.get("evidence", [])],
+                "want_citations": prefs["want_citations"],
+                "want_code": prefs["want_code"],
             },
         )
         for task in state["plan"].tasks
@@ -373,26 +470,32 @@ Constraints:
 - Target words ±20%.
 - Keep the section concise.
 - Avoid repetition and unnecessary explanations.
+- Match the requested audience and tone.
 - Output only section markdown starting with "## <Section Title>".
 
 Scope guard:
 - If blog_kind=="news_roundup", do NOT drift into tutorials (scraping/RSS/how to fetch).
   Focus on events + implications.
 
-Grounding:
-- If mode=="open_book": do not introduce any specific event/company/model/funding/policy claim unless supported by provided Evidence URLs.
-  For each supported claim, attach a Markdown link ([Source](URL)).
-  If unsupported, write "Not found in provided sources."
-- If requires_citations==true (hybrid tasks): cite Evidence URLs for external claims.
+Grounding & citations:
+- If citations are ENABLED and mode=="open_book": do not introduce any specific
+  event/company/model/funding/policy claim unless supported by a provided Evidence URL,
+  and attach a Markdown link ([Source](URL)). If unsupported, write "Not found in provided sources."
+- If citations are ENABLED and requires_citations==true (hybrid tasks): cite Evidence URLs for external claims.
+- If citations are DISABLED: do NOT add any source links or citations; write in your own
+  words and avoid asserting unverifiable specifics.
 
 Code:
-- If requires_code==true, include at least one minimal snippet.
+- If code is ENABLED and (requires_code==true or a snippet clearly helps): include one minimal snippet.
+- If code is DISABLED: do NOT include any code fences or snippets.
 """
 
 def worker_node(payload: dict) -> dict:
     task = Task(**payload["task"])
     plan = Plan(**payload["plan"])
     evidence = [EvidenceItem(**e) for e in payload.get("evidence", [])]
+    want_citations = bool(payload.get("want_citations", True))
+    want_code = bool(payload.get("want_code", True))
 
     bullets_text = "\n- " + "\n- ".join(task.bullets)
     evidence_text = "\n".join(
@@ -413,6 +516,8 @@ def worker_node(payload: dict) -> dict:
                     f"Topic: {payload['topic']}\n"
                     f"Mode: {payload.get('mode')}\n"
                     f"As-of: {payload.get('as_of')} (recency_days={payload.get('recency_days')})\n\n"
+                    f"Citations enabled: {want_citations}\n"
+                    f"Code enabled: {want_code}\n\n"
                     f"Section title: {task.title}\n"
                     f"Goal: {task.goal}\n"
                     f"Target words: {task.target_words}\n"
@@ -456,10 +561,16 @@ Return strictly GlobalImagePlan.
 """
 
 def decide_images(state: State) -> dict:
-    planner = structured_llm(GlobalImagePlan)
+    prefs = _get_prefs(state)
     merged_md = state["merged_md"]
     plan = state["plan"]
     assert plan is not None
+
+    # Hard off: the user disabled diagram generation → no placeholders, no images.
+    if not prefs["want_images"]:
+        return {"md_with_placeholders": merged_md, "image_specs": []}
+
+    planner = structured_llm(GlobalImagePlan)
 
     image_plan = planner.invoke(
         [
@@ -538,27 +649,6 @@ def generate_and_place_images(state: State) -> dict:
 
 import urllib.parse
 import requests
-
-def _pollinations_generate_image_bytes(prompt: str, size: str = "1024x1024") -> bytes:
-    """
-    Returns raw image bytes generated by Pollinations AI (free, no API key).
-    """
-    width_str, height_str = size.split("x")
-    width, height = int(width_str), int(height_str)
-
-    encoded_prompt = urllib.parse.quote(prompt)
-    url = (
-        f"https://image.pollinations.ai/prompt/{encoded_prompt}"
-        f"?width={width}&height={height}&nologo=true&model=flux"
-    )
-
-    resp = requests.get(url, timeout=60)
-    resp.raise_for_status()
-
-    if not resp.content or len(resp.content) < 1000:
-        raise RuntimeError("Pollinations returned empty/invalid image data.")
-
-    return resp.content
 
 def _pollinations_generate_image_bytes(prompt: str, size: str = "1024x1024") -> bytes:
     """

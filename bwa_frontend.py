@@ -193,12 +193,47 @@ st.set_page_config(page_title="LangGraph Blog Writer", layout="wide")
 st.title("Blog Writing Agent")
 
 with st.sidebar:
-    st.header("Generate New Blog")
+    st.header("Blog Settings")
+
     topic = st.text_area(
         "Topic",
         height=120,
+        placeholder="e.g. How self-attention works in Transformers",
     )
-    as_of = st.date_input("As-of date", value=date.today())
+
+    blog_type = st.radio(
+        "Blog Type",
+        ["Tutorial", "Explainer", "News", "Comparison", "System Design"],
+        index=1,
+    )
+    audience = st.radio(
+        "Audience",
+        ["Beginner", "Intermediate", "Advanced"],
+        index=1,
+    )
+    tone = st.radio(
+        "Tone",
+        ["Professional", "Casual", "Academic"],
+        index=0,
+    )
+    length = st.radio(
+        "Length",
+        ["Short", "Medium", "Long"],
+        index=1,
+        help="Short ≈ 600 words · Medium ≈ 1200 · Long ≈ 2000",
+    )
+
+    st.markdown("**Options**")
+    want_research = st.checkbox("Web Research", value=True)
+    want_images = st.checkbox("Generate diagrams", value=True)
+    want_citations = st.checkbox("Add citations", value=True)
+    want_code = st.checkbox("Include examples", value=True)
+
+    as_of = st.date_input(
+        "As-of date",
+        value=date.today(),
+        help="Used for recency filtering during web research.",
+    )
     run_btn = st.button("🚀 Generate Blog", type="primary")
 
     # ✅ NEW: Past blogs list (keeps everything else intact)
@@ -272,10 +307,22 @@ if run_btn:
         st.warning("Please enter a topic.")
         st.stop()
 
+    prefs: Dict[str, Any] = {
+        "blog_type": blog_type,
+        "audience": audience,
+        "tone": tone,
+        "length": length,
+        "want_research": bool(want_research),
+        "want_images": bool(want_images),
+        "want_citations": bool(want_citations),
+        "want_code": bool(want_code),
+    }
+
     inputs: Dict[str, Any] = {
         "topic": topic.strip(),
+        "prefs": prefs,
         "mode": "",
-        "needs_research": False,
+        "needs_research": bool(want_research),
         "queries": [],
         "evidence": [],
         "plan": None,
@@ -306,6 +353,13 @@ if run_btn:
             current_state = extract_latest_state(current_state, payload)
 
             summary = {
+                "settings": f"{blog_type} · {audience} · {tone} · {length}",
+                "toggles": {
+                    "research": bool(want_research),
+                    "images": bool(want_images),
+                    "citations": bool(want_citations),
+                    "code": bool(want_code),
+                },
                 "mode": current_state.get("mode"),
                 "needs_research": current_state.get("needs_research"),
                 "queries": current_state.get("queries", [])[:5] if isinstance(current_state.get("queries"), list) else [],
